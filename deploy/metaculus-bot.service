@@ -1,0 +1,13 @@
+# /etc/systemd/system/metaculus-bot.service
+# Adjust the path if the project is not in /opt/metaculus-bot.
+[Unit]
+Description=Metaculus forecasting bot (one pass)
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/metaculus-bot/deploy/run-once.sh
+# The bot stops itself after about 28 minutes at most (process watchdog); this is the outer backstop.
+TimeoutStartSec=1900
+Nice=5

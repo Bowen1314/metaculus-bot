@@ -1,0 +1,54 @@
+# NOT active: it only runs if copied to .github/workflows/ in a GitHub repository.
+# The recommended way to run this bot is the systemd timer (see README). This file shows what
+# GitHub Actions, the official template's default, would need.
+#
+# Repository secrets to create: METACULUS_TOKEN, OPENROUTER_API_KEY
+# (optional: ASKNEWS_CLIENT_ID, ASKNEWS_SECRET).
+#
+# Differences from the server set-up, all of them drawbacks:
+#   * Scheduled workflows start late (often 5-30 minutes, sometimes skipped) and are switched
+#     off after 60 days without repository activity. Question windows are about 3 hours.
+#   * The runner starts with an empty disk, so state/ is restored from the Actions cache.
+#     If the cache is lost, the bot still never forecasts twice (Metaculus reports which
+#     questions it has answered), but the day/season spend totals and pending comment retries
+#     are lost.
+#   * The bot ignores the process environment by design, so the secrets are written to .env.
+name: forecast
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: forecast
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
+      - name: Write .env from repository secrets
+        run: |
+          umask 077
+          {
+            echo "METACULUS_TOKEN=${{ secrets.METACULUS_TOKEN }}"
+            echo "OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}"
+            echo "ASKNEWS_CLIENT_ID=${{ secrets.ASKNEWS_CLIENT_ID }}"
+            echo "ASKNEWS_SECRET=${{ secrets.ASKNEWS_SECRET }}"
+          } > .env
+      - run: python run.py run --live
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state
+          key: bot-state-${{ github.run_id }}

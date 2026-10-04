@@ -1,0 +1,12 @@
+# /etc/systemd/system/metaculus-bot.timer
+[Unit]
+Description=Run the Metaculus forecasting bot every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=45
+Persistent=true
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target

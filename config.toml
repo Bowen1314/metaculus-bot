@@ -1,0 +1,103 @@
+# Non-secret settings. Secrets live only in .env (see env.example).
+
+# Live submission needs BOTH `run --live` on the command line AND armed = true here.
+# Leave false until a dry run on the bot testing area has been reviewed.
+armed = false
+
+# Where local state lives (relative to the project directory).
+state_dir = "state"
+log_dir = "logs"
+
+# Tournaments are processed in this order; earlier ones get budget first.
+[[tournament]]
+name = "main"
+id = "fall-futureeval-2026"   # project id 33121; change every season
+profile = "full"
+
+[[tournament]]
+name = "minibench"
+id = "minibench"              # this slug always points at the current two-week round
+profile = "lean"
+min_season_budget_left_usd = 60.0   # skip MiniBench when less than this is left for the season
+
+# The unscored area used by `dry-run` and `submit-test`.
+[testing]
+id = "bot-testing-area"
+profile = "full"
+
+# Model ids are litellm names. They were taken from OpenRouter's public model list on 2026-10-02.
+# ":online" turns on the provider's own web search (covered by the donated credits; Exa is not).
+# No Gemini ":online": this key reaches Gemini only through Google AI Studio on a BYOK account whose
+# search quota is used up (429 "limit_source: upstream_provider_account", 2026-10-04); Claude's
+# search is a different engine from OpenAI's, which keeps the two sources independent.
+[profile.full]
+forecasters = [
+  "openrouter/openai/gpt-6.1-sol",
+  "openrouter/anthropic/claude-opus-5.5",
+  "openrouter/google/gemini-3.8-flash",
+  "openrouter/openai/gpt-6.1-sol",
+  "openrouter/anthropic/claude-opus-5.5",
+]
+search_models = ["openrouter/openai/gpt-6.1-sol:online", "openrouter/anthropic/claude-sonnet-5.5:online"]
+use_asknews = true            # only used if AskNews credentials are in .env
+
+[profile.lean]
+forecasters = [
+  "openrouter/openai/gpt-6.1-sol",
+  "openrouter/anthropic/claude-sonnet-5.5",
+  "openrouter/google/gemini-3.8-flash",
+]
+search_models = ["openrouter/anthropic/claude-haiku-4.5:online", "openrouter/openai/gpt-6-luna:online"]
+use_asknews = false
+
+[models]
+parser = "openrouter/openai/gpt-6-luna"   # only used when the regex parser cannot read a model's answer
+reasoning_effort = "high"
+forecast_timeout_s = 240
+search_timeout_s = 180
+parser_timeout_s = 60
+allowed_tries = 2             # library-level retries per LLM call (random exponential backoff)
+max_output_tokens = 20000     # ceiling per call, reasoning included; an empty answer fails over to another model
+# Gemini (Google AI Studio, BYOK) often fails within seconds with an upstream quota error and no answer
+# text; the extra try, after the library's 5-60 s backoff, usually gets through. Then fail-over.
+allowed_tries_by_model = { "google/gemini-3.8-flash" = 3 }
+
+[ensemble]
+min_successful_fraction = 0.4   # with 5 runs: at least 2 must succeed, else the question is retried later
+model_failover = 1              # if a run's model errors, try this many other models for that run
+allow_forecast_without_research = false
+
+[calibration]
+binary_min = 0.03
+binary_max = 0.97
+option_min = 0.02               # floor per multiple-choice option before renormalising
+
+[limits]
+max_question_usd = 1.50
+max_run_usd = 6.00
+max_day_usd = 12.00
+max_season_usd = 100.00         # the credit grant (2026-10-04: $100; raise it if the grant is raised)
+max_llm_calls_per_question = 24
+openrouter_min_remaining_usd = 2.00   # stop when the OpenRouter key reports less than this left
+max_attempts_per_question = 6
+max_concurrent_questions = 2
+question_timeout_s = 600
+run_time_budget_s = 780         # stop starting new questions after this; the next timer tick continues
+min_seconds_before_close = 360  # do not start a question that closes sooner than this
+asknews_monthly_call_units = 900
+asknews_units_per_question = 6     # the library makes one latest-news call (1 unit) and one archive call (5 units)
+research_chars_per_source = 12000
+
+# USD per million tokens (input, output); used when the provider response carries no cost.
+# Unknown models are charged at the "default" rate, deliberately high.
+[prices]
+"openai/gpt-6.1-sol" = [2.0, 10.0]
+"openai/gpt-6-sol" = [2.0, 10.0]
+"openai/gpt-6-luna" = [0.10, 0.50]
+"openai/gpt-6-astra" = [10.0, 50.0]
+"anthropic/claude-opus-5.5" = [4.0, 20.0]
+"anthropic/claude-sonnet-5.5" = [2.0, 10.0]
+"anthropic/claude-haiku-4.5" = [1.0, 5.0]
+"google/gemini-3.8-flash" = [0.75, 3.75]
+default = [15.0, 75.0]
+search_call_fee_usd = 0.04      # flat allowance per ":online" call for provider search fees

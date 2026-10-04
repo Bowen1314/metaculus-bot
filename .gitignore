@@ -1,0 +1,15 @@
+# Secrets: never commit. The committed template is env.example (no leading dot).
+.env
+.env.*
+
+# Local state, logs, virtualenv
+.venv/
+state/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.sqlite3
+*.sqlite3-journal
+*.lock
+.DS_Store
