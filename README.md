@@ -174,7 +174,7 @@ bot/forecaster.py   EnsembleBot on top of the library's FallTemplateBot2026
 bot/research.py     web-search models (+ AskNews), each allowed to fail
 bot/parsing.py      reads the models' answers without an LLM where possible
 bot/numeric.py      percentile clean-up, Metaculus's CDF rules, repair, mixture
-bot/aggregate.py    median + clip (binary), mean + floor (multiple choice)
+bot/aggregate.py    one vote per model: mean + extremize + clip (binary), mean + floor (multiple choice)
 bot/runner.py       one pass: select, forecast, submit, recover
 bot/ledger.py       SQLite record of every question, spend and run
 bot/spend.py        per-question / run / day / season limits

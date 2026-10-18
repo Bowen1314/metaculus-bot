@@ -47,7 +47,9 @@ forecasters = [
   "openrouter/anthropic/claude-sonnet-5.5",
   "openrouter/google/gemini-3.8-flash",
 ]
-search_models = ["openrouter/anthropic/claude-haiku-4.5:online", "openrouter/openai/gpt-6-luna:online"]
+# 2026-10-18: same two search sources as main (was claude-haiku-4.5:online + gpt-6-luna:online); the
+# 10-05 round's biggest losses were research missing key numbers (analysis/2026-10-18-accuracy.md).
+search_models = ["openrouter/openai/gpt-6.1-sol:online", "openrouter/anthropic/claude-sonnet-5.5:online"]
 use_asknews = false
 
 [models]
@@ -57,20 +59,27 @@ forecast_timeout_s = 240
 search_timeout_s = 180
 parser_timeout_s = 60
 allowed_tries = 2             # library-level retries per LLM call (random exponential backoff)
-max_output_tokens = 20000     # ceiling per call, reasoning included; an empty answer fails over to another model
+max_output_tokens = 20000     # ceiling per call, reasoning included; an empty answer counts as a failed call
 # Gemini (Google AI Studio, BYOK) often fails within seconds with an upstream quota error and no answer
-# text; the extra try, after the library's 5-60 s backoff, usually gets through. Then fail-over.
+# text; the extra try, after the library's 5-60 s backoff, usually gets through. Then the run is dropped
+# (model_failover = 0).
 allowed_tries_by_model = { "google/gemini-3.8-flash" = 3 }
 
 [ensemble]
+# With aggregate = "per_model_mean" the fraction is also applied to distinct models: of the 3 models
+# at least 2 must succeed (in either profile), else the question is retried on a later run.
 min_successful_fraction = 0.4   # with 5 runs: at least 2 must succeed, else the question is retried later
-model_failover = 1              # if a run's model errors, try this many other models for that run
+# 0 = a run whose model fails is dropped, not handed to another model (2026-10-18: in the 10-05
+# MiniBench round every Gemini slot fell back to GPT, so GPT had two of three votes).
+model_failover = 0              # if a run's model errors, try this many other models for that run
+aggregate = "per_model_mean"    # one vote per model: runs of a model are combined first; "per_run" = old median
 allow_forecast_without_research = false
 
 [calibration]
 binary_min = 0.03
 binary_max = 0.97
 option_min = 0.02               # floor per multiple-choice option before renormalising
+binary_extremize = 1.2          # logit(p) x 1.2 after aggregation, then the clip above (2026-10-18; 1.0 = off)
 
 [limits]
 max_question_usd = 1.50

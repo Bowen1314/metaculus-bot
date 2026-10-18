@@ -3,8 +3,10 @@ The forecasting bot: the official FallTemplateBot2026 with a cross-lab ensemble.
 
 Kept from the template: the forecasting prompts, one research report shared by all runs, the
 LLM-based answer parser (now only a fallback), the comment format.
-Changed: several research sources, each run uses a named model with fail-over to another lab,
-deterministic parsing first, percentile clean-up, aggregation (bot/aggregate.py, bot/numeric.py).
+Changed: several research sources, each run uses a named model (optionally with fail-over to
+another lab; with [ensemble] model_failover = 0 a failed run is simply dropped, so every model
+keeps exactly its own votes), deterministic parsing first, percentile clean-up, aggregation
+(bot/aggregate.py, bot/numeric.py), optionally one vote per model and binary extremizing.
 
 This class never submits anything: `publish_reports_to_metaculus` is forced to False and the
 runner does the submitting, behind the ledger.
@@ -47,6 +49,10 @@ logger = logging.getLogger(__name__)
 
 # Models to try, in order, for the forecasting run executing in the current task.
 _run_models: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("run_models", default=())
+# Slot number of that run. The library hands the aggregation the successful runs in slot order
+# (asyncio.gather keeps task order), while run_details is filled in completion order; the slot
+# lines the two up.
+_run_slot: contextvars.ContextVar[int] = contextvars.ContextVar("run_slot", default=-1)
 
 # Per-run clamp before aggregation (the template's own values).
 _RUN_MIN, _RUN_MAX = 0.01, 0.99
@@ -82,6 +88,7 @@ class EnsembleBot(FallTemplateBot2026):
         self._slots: dict[int, int] = {}
         self.run_details: dict[int, list[dict[str, Any]]] = {}
         self.final_cdfs: dict[int, list[float]] = {}
+        self.aggregation_notes: dict[int, str] = {}
         parser = factory.parser()
         super().__init__(
             research_reports_per_question=1,
@@ -118,6 +125,18 @@ class EnsembleBot(FallTemplateBot2026):
     async def run_research(self, question: MetaculusQuestion) -> str:
         return await self.researcher.run(question, self.profile)
 
+    async def _run_individual_question(self, question: MetaculusQuestion):
+        # A fresh start for this question's slots and run records (matters only if the same bot
+        # forecasts the same question twice).
+        key = question.id_of_question
+        if key is not None:
+            key = int(key)
+            self._slots.pop(key, None)
+            self.run_details.pop(key, None)
+            self.aggregation_notes.pop(key, None)
+            self.final_cdfs.pop(key, None)
+        return await super()._run_individual_question(question)
+
     # ------------------------------------------------------------------ model choice
 
     def _models_for_slot(self, slot: int) -> tuple[str, ...]:
@@ -137,9 +156,11 @@ class EnsembleBot(FallTemplateBot2026):
         slot = self._slots.get(key, 0)  # no await between read and write: slots are unique
         self._slots[key] = slot + 1
         token = _run_models.set(self._models_for_slot(slot))
+        slot_token = _run_slot.set(slot)
         try:
             return await super()._make_prediction(question, research)
         finally:
+            _run_slot.reset(slot_token)
             _run_models.reset(token)
 
     async def _invoke_forecaster(self, prompt: str) -> tuple[str, str]:
@@ -166,7 +187,12 @@ class EnsembleBot(FallTemplateBot2026):
 
     def _note_run(self, question: MetaculusQuestion, model: str, readable: str, parsed_by: str) -> None:
         self.run_details.setdefault(question_key(question), []).append(
-            {"model": model.removeprefix("openrouter/"), "prediction": readable, "parsed_by": parsed_by}
+            {
+                "model": model.removeprefix("openrouter/"),
+                "prediction": readable,
+                "parsed_by": parsed_by,
+                "slot": _run_slot.get(),
+            }
         )
 
     # ------------------------------------------------------------------ binary
@@ -340,25 +366,92 @@ class EnsembleBot(FallTemplateBot2026):
 
     # ------------------------------------------------------------------ aggregation
 
+    @property
+    def _per_model(self) -> bool:
+        return self.cfg.ensemble.aggregate == "per_model_mean"
+
+    def _models_of(self, question: MetaculusQuestion, predictions: list) -> list[str] | None:
+        """The model behind each prediction, in the order the library passes them (slot order)."""
+        runs = sorted(self.run_details.get(question_key(question), []), key=lambda run: run.get("slot", -1))
+        if len(runs) != len(predictions) or any(run.get("slot", -1) < 0 for run in runs):
+            logger.warning(
+                "q%s: cannot match %d predictions to %d recorded runs; every run counts as its own vote",
+                question.id_of_question, len(predictions), len(runs),
+            )
+            return None
+        return [run["model"] for run in runs]
+
+    def _check_enough_models(self, question: MetaculusQuestion, models: list[str]) -> None:
+        """With one vote per model, success is counted in models, not runs: in the full profile two
+        GPT runs alone pass the library's run count but are one model. Raising here sends the
+        question down the usual path (attempt recorded, retried on a later run)."""
+        configured = {m.removeprefix("openrouter/") for m in self.profile.forecasters}
+        succeeded = set(models)
+        needed = len(configured) * self.cfg.ensemble.min_successful_fraction
+        if len(succeeded) < needed:
+            raise ValueError(
+                f"Expected successful predictions from at least {needed:g} of {len(configured)} models, "
+                f"but only got {len(succeeded)} ({', '.join(sorted(succeeded))})"
+            )
+
+    def _note_aggregation(self, question: MetaculusQuestion, text: str) -> None:
+        key = question_key(question)
+        self.aggregation_notes[key] = text
+        logger.info("q%s aggregate (%s): %s", key, self.cfg.ensemble.aggregate, text)
+
     async def _aggregate_predictions(self, predictions: list, question: MetaculusQuestion):
         if not predictions:
             raise ValueError("Cannot aggregate empty list of predictions")
         calibration = self.cfg.calibration
+        models: list[str] | None = None
+        if self._per_model:
+            models = self._models_of(question, predictions)
+            if models is not None:
+                self._check_enough_models(question, models)
+            else:
+                models = [f"run{i + 1}" for i in range(len(predictions))]
         if isinstance(question, BinaryQuestion):
-            return aggregate.aggregate_binary(
-                predictions, low=calibration.binary_min, high=calibration.binary_max
+            low, high, factor = calibration.binary_min, calibration.binary_max, calibration.binary_extremize
+            if models is not None:
+                result = aggregate.aggregate_binary_by_model(
+                    predictions, models, low=low, high=high, extremize_factor=factor
+                )
+                self._note_aggregation(question, result.describe())
+                return result.final
+            final = aggregate.aggregate_binary(predictions, low=low, high=high, extremize_factor=factor)
+            median = aggregate.aggregate_binary(predictions, low=0.0, high=1.0)
+            self._note_aggregation(
+                question,
+                f"runs [{', '.join(f'{float(p):.3f}' for p in predictions)}]; median={median:.4f}; "
+                f"extremized(logit x {factor:g})={aggregate.extremize(median, factor):.4f}; final={final:.4f}",
             )
+            return final
         if isinstance(question, MultipleChoiceQuestion):
             options = list(question.options)
             runs = [{o.option_name: o.probability for o in p.predicted_options} for p in predictions]
-            final = aggregate.aggregate_options(runs, options, floor=calibration.option_min)
+            if models is not None:
+                final = aggregate.aggregate_options_by_model(runs, models, options, floor=calibration.option_min)
+                groups = aggregate.group_by_model(runs, models)
+                votes = "; ".join(
+                    f"{model} ({len(group)} run{'s' if len(group) > 1 else ''}): "
+                    + ", ".join(f"{o}={sum(r[o] for r in group) / len(group):.3f}" for o in options)
+                    for model, group in groups.items()
+                )
+                note = f"per-model votes [{votes}]; final " + ", ".join(f"{o}={final[o]:.3f}" for o in options)
+            else:
+                final = aggregate.aggregate_options(runs, options, floor=calibration.option_min)
+                note = f"mean of {len(runs)} runs; final " + ", ".join(f"{o}={final[o]:.3f}" for o in options)
+            self._note_aggregation(question, note[:1500])
             return _option_list(options, final)
         if isinstance(question, (NumericQuestion, DateQuestion)):
-            return self._aggregate_numeric(predictions, question)
+            return self._aggregate_numeric(predictions, question, models)
         raise UnsupportedQuestion(f"unsupported question type {type(question).__name__}")
 
     def _aggregate_numeric(
-        self, predictions: list[NumericDistribution], question: NumericQuestion | DateQuestion
+        self,
+        predictions: list[NumericDistribution],
+        question: NumericQuestion | DateQuestion,
+        models: list[str] | None = None,
     ) -> NumericDistribution:
         rules = dict(
             cdf_size=question.cdf_size,
@@ -366,24 +459,39 @@ class EnsembleBot(FallTemplateBot2026):
             open_upper_bound=question.open_upper_bound,
         )
         cdfs: list[list[float]] = []
+        kept: list[str] = []
         x_axis: list[float] | None = None
-        for prediction in predictions:
+        for index, prediction in enumerate(predictions):
             points = cdf_points(prediction)
             heights = [point.percentile for point in points]
             if numeric.validate_cdf(heights, **rules):
                 continue
             cdfs.append(heights)
+            kept.append(models[index] if models is not None else f"run{index + 1}")
             x_axis = [point.value for point in points]
         if not cdfs or x_axis is None:
             raise ValueError("no valid CDF among the runs")
+        weights = aggregate.model_weights(kept) if models is not None else None
+        if weights is not None:
+            per_model: dict[str, list[float]] = {}
+            for model, weight in zip(kept, weights):
+                per_model.setdefault(model, []).append(weight)
+            note = "mixture, equal weight per model [" + ", ".join(
+                f"{model}={sum(w):.3f}" + (f" ({len(w)} runs)" if len(w) > 1 else "")
+                for model, w in per_model.items()
+            ) + "]"
+        else:
+            note = f"equal-weight mixture of {len(cdfs)} runs"
         try:
-            final = numeric.ensure_valid_cdf(numeric.mixture_cdf(cdfs), **rules)
+            final = numeric.ensure_valid_cdf(numeric.mixture_cdf(cdfs, weights), **rules)
         except ValueError as error:
             logger.warning("mixture CDF rejected (%s); falling back to the pointwise median", error)
             import numpy as np
 
             final = numeric.ensure_valid_cdf(np.median(np.asarray(cdfs), axis=0).tolist(), **rules)
+            note = f"pointwise median of {len(cdfs)} runs (mixture rejected)"
         self.final_cdfs[question_key(question)] = final
+        self._note_aggregation(question, note)
         first = predictions[0]
         return NumericDistribution(
             declared_percentiles=[Percentile(value=x, percentile=h) for x, h in zip(x_axis, final)],
@@ -404,15 +512,35 @@ class EnsembleBot(FallTemplateBot2026):
         explanation = super()._create_unified_explanation(
             question, research_prediction_collections, aggregated_prediction, final_cost, time_spent_in_minutes
         )
-        runs = self.run_details.get(question_key(question), [])
+        key = question_key(question)
+        runs = sorted(self.run_details.get(key, []), key=lambda run: run.get("slot", -1))
         lines = [f"- {run['model']}: {run['prediction']}" for run in runs]
+        calibration = self.cfg.calibration
+        clip = f"clipped to [{calibration.binary_min:.0%}, {calibration.binary_max:.0%}]"
+        push = (
+            f"then extremized (log-odds x {calibration.binary_extremize:g}) and {clip}"
+            if calibration.binary_extremize != 1.0
+            else clip
+        )
+        if self._per_model:
+            method = (
+                "one vote per model (a model's runs are combined first); binary = mean of the model votes, "
+                f"{push}; multiple choice = mean of the model votes; numeric = mixture of the runs' "
+                "distributions with equal weight per model."
+            )
+        else:
+            method = (
+                f"binary = median of runs, {push}; multiple choice = mean; "
+                "numeric = equal-weight mixture of the runs' distributions."
+            )
         notes = (
             "\n\n# NOTES\n"
             "Automated forecast, no human in the loop. Research from several web-search sources, "
-            "then independent runs on models from different labs; binary = median of runs, "
-            "multiple choice = mean, numeric = equal-weight mixture of the runs' distributions.\n"
+            "then independent runs on models from different labs; " + method + "\n"
             + "\n".join(lines)
         )
+        if key in self.aggregation_notes:
+            notes += "\nAggregation: " + self.aggregation_notes[key]
         return explanation + notes
 
 

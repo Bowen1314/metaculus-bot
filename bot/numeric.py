@@ -140,17 +140,24 @@ def ensure_valid_cdf(
     return repaired
 
 
-def mixture_cdf(cdfs: Sequence[Sequence[float]]) -> list[float]:
+def mixture_cdf(cdfs: Sequence[Sequence[float]], weights: Sequence[float] | None = None) -> list[float]:
     """
-    Equal-weight mixture of forecasts = pointwise mean of their CDFs. A mean of CDFs that each
-    satisfy the server rules satisfies them too (all the rules are convex constraints).
+    Mixture of forecasts = pointwise (weighted) mean of their CDFs; equal weights by default.
+    A convex combination of CDFs that each satisfy the server rules satisfies them too (all the
+    rules are convex constraints).
     """
     if not cdfs:
         raise ValueError("no cdfs to aggregate")
     lengths = {len(c) for c in cdfs}
     if len(lengths) != 1:
         raise ValueError(f"cdfs have different lengths: {sorted(lengths)}")
-    return [float(v) for v in np.mean(np.asarray(cdfs, dtype=float), axis=0)]
+    if weights is None:
+        return [float(v) for v in np.mean(np.asarray(cdfs, dtype=float), axis=0)]
+    w = np.asarray(weights, dtype=float)
+    if w.shape != (len(cdfs),) or not np.all(np.isfinite(w)) or np.any(w < 0) or w.sum() <= 0:
+        raise ValueError("mixture weights must be one non-negative number per cdf, not all zero")
+    w = w / w.sum()
+    return [float(v) for v in w @ np.asarray(cdfs, dtype=float)]
 
 
 def sanitize_percentiles(

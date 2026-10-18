@@ -168,3 +168,27 @@ def test_sanitize_percentiles():
         numeric.sanitize_percentiles([(0.5, 1.0)], lower_bound=0.0, upper_bound=100.0)
     with pytest.raises(ValueError):
         numeric.sanitize_percentiles([(0.1, 1.0), (0.9, 2.0)], lower_bound=5.0, upper_bound=5.0)
+
+
+def test_weighted_mixture_gives_each_model_its_share(by_type):
+    question = by_type["numeric"]
+    low_run = cdf_for(question, (0.10, 0.12, 0.15, 0.17, 0.20, 0.22))
+    mid_run = cdf_for(question, (0.40, 0.45, 0.48, 0.52, 0.55, 0.60))
+    high_run = cdf_for(question, (0.78, 0.80, 0.83, 0.85, 0.88, 0.90))
+    # two runs of model "gpt" (low, low), one of "claude" (mid), one of "gemini" (high)
+    from bot.aggregate import model_weights
+
+    weights = model_weights(["gpt", "gpt", "claude", "gemini"])
+    mixture = numeric.mixture_cdf([low_run, low_run, mid_run, high_run], weights)
+    expected = (np.array(low_run) + np.array(mid_run) + np.array(high_run)) / 3
+    assert mixture == pytest.approx(list(expected))
+    assert numeric.validate_cdf(mixture, **rules(question)) == []
+    # equal weights reproduce the plain mixture; weights are normalised
+    plain = numeric.mixture_cdf([low_run, high_run])
+    assert numeric.mixture_cdf([low_run, high_run], [2.0, 2.0]) == pytest.approx(plain)
+
+
+@pytest.mark.parametrize("weights", [[1.0], [1.0, -0.5], [0.0, 0.0], [1.0, float("nan")]])
+def test_weighted_mixture_rejects_bad_weights(weights):
+    with pytest.raises(ValueError):
+        numeric.mixture_cdf([[0.0, 0.5, 1.0], [0.0, 0.4, 1.0]], weights)

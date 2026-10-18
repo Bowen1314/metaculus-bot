@@ -71,6 +71,19 @@ def main(argv: list[str] | None = None) -> int:
     logger.info(report.describe())
     for warning in report.warnings:
         logger.warning(warning)
+    logger.info(
+        "ensemble: aggregate=%s model_failover=%d min_successful_fraction=%g; binary: extremize=%g clip=[%g, %g]; %s",
+        config.ensemble.aggregate,
+        config.ensemble.model_failover,
+        config.ensemble.min_successful_fraction,
+        config.calibration.binary_extremize,
+        config.calibration.binary_min,
+        config.calibration.binary_max,
+        "; ".join(
+            f"{name}: search={','.join(m.removeprefix('openrouter/') for m in profile.search_models)}"
+            for name, profile in config.profiles.items()
+        ),
+    )
 
     if args.command == "doctor":
         from bot.doctor import doctor

@@ -44,6 +44,9 @@ class Ensemble:
     min_successful_fraction: float = 0.4
     model_failover: int = 1
     allow_forecast_without_research: bool = False
+    # "per_run" (binary median of runs) or "per_model_mean" (one vote per model); see bot/aggregate.py.
+    # The defaults are the original behaviour, so a config.toml without the key runs as before.
+    aggregate: str = "per_run"
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,7 @@ class Calibration:
     binary_min: float = 0.03
     binary_max: float = 0.97
     option_min: float = 0.02
+    binary_extremize: float = 1.0   # logit(p) x this after aggregation, before the clip; 1 = off
 
 
 @dataclass(frozen=True)
@@ -153,6 +157,14 @@ def load_config(path: Path | str | None = None) -> Config:
     calibration = Calibration(**raw.get("calibration", {}))
     if not (0.001 <= calibration.binary_min < calibration.binary_max <= 0.999):
         raise ValueError("calibration.binary_min/max must satisfy 0.001 <= min < max <= 0.999")
+    if not (0.5 <= float(calibration.binary_extremize) <= 3.0):
+        raise ValueError("calibration.binary_extremize must be within [0.5, 3.0] (1.0 = off)")
+
+    ensemble = Ensemble(**raw.get("ensemble", {}))
+    if ensemble.aggregate not in ("per_run", "per_model_mean"):
+        raise ValueError("ensemble.aggregate must be \"per_run\" or \"per_model_mean\"")
+    if ensemble.model_failover < 0:
+        raise ValueError("ensemble.model_failover must be >= 0")
 
     return Config(
         armed=bool(raw.get("armed", False)),
@@ -162,7 +174,7 @@ def load_config(path: Path | str | None = None) -> Config:
         testing=testing,
         profiles=profiles,
         models=Models(**raw.get("models", {})),
-        ensemble=Ensemble(**raw.get("ensemble", {})),
+        ensemble=ensemble,
         calibration=calibration,
         limits=Limits(**raw.get("limits", {})),
         prices=prices,

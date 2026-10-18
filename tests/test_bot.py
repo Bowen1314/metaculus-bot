@@ -35,6 +35,15 @@ def forecast(bot, question):
     return asyncio.run(bot.forecast_question(question))
 
 
+def legacy(config, **ensemble):
+    """The original ensemble: fail-over to another lab, binary median of runs, no extremizing."""
+    return dataclasses.replace(
+        config,
+        ensemble=dataclasses.replace(config.ensemble, aggregate="per_run", model_failover=1, **ensemble),
+        calibration=dataclasses.replace(config.calibration, binary_extremize=1.0),
+    )
+
+
 def runs_of(bot, question) -> list[dict]:
     return bot.run_details[question.id_of_question]
 
@@ -118,13 +127,24 @@ def test_unanimous_certainty_is_clipped(config, make_factory, by_type, answer, e
     assert submission.payload["probability_yes"] == pytest.approx(expected)
 
 
-def test_one_wild_run_does_not_move_a_binary_forecast(config, make_factory, by_type):
+def test_per_run_median_ignores_one_wild_run(config, make_factory, by_type):
+    cfg = legacy(config)
+    responder = CountingResponder()
+    responder.text_for = {"gemini": "Probability: 99%", "gpt": "Probability: 20%", "claude": "Probability: 24%"}
+    factory, _ = make_factory(responder, cfg=cfg)
+    bot = make_bot(cfg, factory)
+    submission = build_submission(by_type["binary"], forecast(bot, by_type["binary"]), bot)
+    assert 0.20 <= submission.payload["probability_yes"] <= 0.24
+
+
+def test_per_model_mean_gives_a_dissenting_model_its_full_vote(config, make_factory, by_type):
     responder = CountingResponder()
     responder.text_for = {"gemini": "Probability: 99%", "gpt": "Probability: 20%", "claude": "Probability: 24%"}
     factory, _ = make_factory(responder)
     bot = make_bot(config, factory)
     submission = build_submission(by_type["binary"], forecast(bot, by_type["binary"]), bot)
-    assert 0.20 <= submission.payload["probability_yes"] <= 0.24
+    expected = aggregate.extremize((0.20 + 0.24 + 0.99) / 3, 1.2)
+    assert submission.payload["probability_yes"] == pytest.approx(expected, abs=1e-6)
 
 
 def test_zero_probability_options_are_floored(config, make_factory, by_type):
@@ -154,11 +174,12 @@ def test_percentiles_tied_at_an_open_bound_do_not_hang(config, make_factory, by_
 
 # ------------------------------------------------------------------ failure: LLM timeout / provider down
 
-def test_llm_timeout_on_one_lab_fails_over_to_another(config, make_factory, by_type):
+def test_with_failover_an_llm_timeout_moves_the_run_to_another_lab(config, make_factory, by_type):
+    cfg = legacy(config)
     responder = CountingResponder()
     responder.raise_for = {"claude-opus-5.5": TimeoutError("litellm.Timeout: request timed out")}
-    factory, _ = make_factory(responder)
-    bot = make_bot(config, factory)
+    factory, _ = make_factory(responder, cfg=cfg)
+    bot = make_bot(cfg, factory)
     report = forecast(bot, by_type["binary"])
     runs = runs_of(bot, by_type["binary"])
     assert len(runs) == 5  # no run was lost
@@ -167,11 +188,12 @@ def test_llm_timeout_on_one_lab_fails_over_to_another(config, make_factory, by_t
     assert 0.03 <= report.prediction <= 0.97
 
 
-def test_two_labs_down_still_forecasts_with_the_third(config, make_factory, by_type):
+def test_with_failover_and_per_run_two_labs_down_still_forecasts_with_the_third(config, make_factory, by_type):
+    cfg = legacy(config)
     responder = CountingResponder()
     responder.raise_for = {"anthropic": TimeoutError("timed out"), "gemini-3.8-flash": ConnectionError("503")}
-    factory, _ = make_factory(responder)
-    bot = make_bot(config, factory)
+    factory, _ = make_factory(responder, cfg=cfg)
+    bot = make_bot(cfg, factory)
     forecast(bot, by_type["binary"])  # research: the gpt search source still answers
     runs = runs_of(bot, by_type["binary"])
     assert 2 <= len(runs) < 5 and all("openai" in run["model"] for run in runs)
@@ -202,7 +224,8 @@ def test_all_forecasters_down_fails_the_question_without_hanging(config, make_fa
     with pytest.raises(BaseException) as caught:
         forecast(bot, by_type["numeric"])
     assert _find(caught.value, TimeoutError) is not None
-    assert responder.forecast_calls() == 10  # 5 runs x (primary + one fail-over), no endless retrying
+    # 5 runs x (primary + fail-overs), no endless retrying; model_failover = 0 -> one call per run
+    assert responder.forecast_calls() == 5 * (1 + config.ensemble.model_failover)
 
 
 def test_question_level_hang_is_cut_by_the_caller(config, make_factory, by_type):
@@ -255,7 +278,9 @@ def test_unreadable_answer_is_rescued_by_the_llm_parser(config, make_factory, by
     forecast(bot, by_type["binary"])
     runs = runs_of(bot, by_type["binary"])
     gemini = [run for run in runs if "gemini" in run["model"]]
-    assert len(runs) == 5 and gemini == [{"model": "google/gemini-3.8-flash", "prediction": "40.0%", "parsed_by": "llm"}]
+    assert len(runs) == 5 and [{k: run[k] for k in ("model", "prediction", "parsed_by")} for run in gemini] == [
+        {"model": "google/gemini-3.8-flash", "prediction": "40.0%", "parsed_by": "llm"}
+    ]
     assert responder.count("gpt-6-luna") == 2  # two agreeing parser samples, as in the template
 
 

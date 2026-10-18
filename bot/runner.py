@@ -606,8 +606,10 @@ class Runner:
             lines.append(f"  option:  {question.group_question_option}")
         if question.close_time:
             lines.append(f"  closes:  {question.close_time.isoformat(timespec='minutes')}")
-        for run in bot.run_details.get(submission.question_id, []):
+        for run in sorted(bot.run_details.get(submission.question_id, []), key=lambda r: r.get("slot", -1)):
             lines.append(f"  run:     {run['model']} -> {run['prediction']}  (parsed by {run['parsed_by']})")
+        if submission.question_id in bot.aggregation_notes:
+            lines.append(f"  agg:     {bot.aggregation_notes[submission.question_id]}")
         lines.append(f"  FINAL:   {submission.readable}")
         payload_text = json.dumps(submission.payload)
         if len(payload_text) > 240 and not self.options.verbose:
